@@ -1,0 +1,184 @@
+//This code is only for Landsat 7 and is a Scan Line Correction
+//this comes from Noel Gorelick on the GEE user's forum 
+
+//Add this to your code just after compositing your imagery,
+////thus ensuring your data are continuous
+
+var MIN_SCALE = 1/3;
+var MAX_SCALE = 3;
+var MIN_NEIGHBORS = 144;
+
+/* Apply the USGS L7 Phase-2 Gap filling protocol, using a single kernel size. */
+var GapFill = function(src, fill, kernelSize, upscale) {
+  var kernel = ee.Kernel.square(kernelSize * 30, "meters", false)
+  
+  // Find the pixels common to both scenes.
+  var common = src.mask().and(fill.mask())
+  var fc = fill.updateMask(common)
+  var sc = src.updateMask(common)
+  //Map.addLayer(common.select(0).mask(common.select(0)), {palette:['000000']}, 'common mask (both exist)', false);
+
+  // Find the primary scaling factors with a regression.
+  // Interleave the bands for the regression.  This assumes the bands have the same names.
+  var regress = fc.addBands(sc)
+
+  regress = regress.select(regress.bandNames().sort())
+  //print(regress,'regress')
+  var ratio = 5
+  
+  if(upscale) {
+    var fit = regress
+      .reduceResolution(ee.Reducer.median(), false, 500)
+      .reproject(regress.select(0).projection().scale(ratio, ratio))
+      .reduceNeighborhood(ee.Reducer.linearFit().forEach(src.bandNames()), kernel, null, false)
+      .unmask()
+      .reproject(regress.select(0).projection().scale(ratio, ratio))
+  } else {
+    
+    var fit = regress
+      .reduceNeighborhood(ee.Reducer.linearFit().forEach(src.bandNames()), kernel, null, false)
+  }
+
+  var offset = fit.select(".*_offset")
+  var scale = fit.select(".*_scale")
+
+  //Map.addLayer(scale.select('B1_scale'), {min:-2, max:2}, 'scale B1', false)
+  
+  // Find the secondary scaling factors using just means and stddev
+  var Reducer = ee.Reducer.mean().combine(ee.Reducer.stdDev(), null, true)
+
+  if(upscale) {
+    var src_stats = src
+      .reduceResolution(ee.Reducer.median(), false, 500)
+      .reproject(regress.select(0).projection().scale(ratio, ratio))
+      .reduceNeighborhood(Reducer, kernel, null, false)
+      .reproject(regress.select(0).projection().scale(ratio, ratio))
+
+    var fill_stats = fill
+      .reduceResolution(ee.Reducer.median(), false, 500)
+      .reproject(regress.select(0).projection().scale(ratio, ratio))
+      .reduceNeighborhood(Reducer, kernel, null, false)
+      .reproject(regress.select(0).projection().scale(ratio, ratio))
+  } else {
+    var src_stats = src
+      .reduceNeighborhood(Reducer, kernel, null, false)
+
+    var fill_stats = fill
+      .reduceNeighborhood(Reducer, kernel, null, false)
+  }
+
+  var scale2 = src_stats.select(".*stdDev").divide(fill_stats.select(".*stdDev"))
+  var offset2 = src_stats.select(".*mean").subtract(fill_stats.select(".*mean").multiply(scale2))
+
+  var invalid = scale.lt(MIN_SCALE).or(scale.gt(MAX_SCALE))
+  //Map.addLayer(invalid.select(0).mask(invalid.select(0)), {palette:['550000']}, 'invalid1', false)
+  scale = scale.where(invalid, scale2)
+  offset = offset.where(invalid, offset2)
+
+  // When all else fails, just use the difference of means as an offset.  
+  var invalid2 = scale.lt(MIN_SCALE).or(scale.gt(MAX_SCALE))
+  //Map.addLayer(invalid2.select(0).mask(invalid2.select(0)), {palette:['552020']}, 'invalid2', false)
+  scale = scale.where(invalid2, 1)
+  offset = offset.where(invalid2, src_stats.select(".*mean").subtract(fill_stats.select(".*mean")))
+
+  // Apply the scaling and mask off pixels that didn't have enough neighbors.
+  var count = common.reduceNeighborhood(ee.Reducer.count(), kernel, null, true, "boxcar")
+  var scaled = fill.multiply(scale).add(offset)
+      .updateMask(count.gte(MIN_NEIGHBORS))
+
+  return src.unmask(scaled, true)
+}
+
+//////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+
+
+
+var SLCcorrection = function(collection, initialDate, finalDate, imgNumSource, imgNumFill, year){
+   // Define a collection filter.
+  var colFilter = ee.Filter.and(
+    ee.Filter.date(initialDate, finalDate),
+    ee.Filter.bounds(pt_wtrshd),
+    //ee.Filter.eq('WRS_PATH', 41), //row and path for the payette watershed, I don't think needs specified 
+    //ee.Filter.eq('WRS_ROW', 29),  //in Alaska.
+  ee.Filter.lt('CLOUD_COVER', 10),  
+    ee.Filter.lt('GEOMETRIC_RMSE_MODEL', 10),
+  ee.Filter.or(
+      ee.Filter.eq('IMAGE_QUALITY', 9),
+      ee.Filter.eq('IMAGE_QUALITY_OLI', 9)
+    ));
+  // Filter collections and prepare them for merging.
+  var l7images = collection.filter(colFilter);
+  print(l7images,'Landsat 7 ' + year);
+  
+  var listOfImages = l7images.toList(l7images.size());
+  print(listOfImages,'listOfImages ' + year);
+  var firstImage  = ee.Image(listOfImages.get(imgNumSource));
+  var secondImage = ee.Image(listOfImages.get(imgNumFill));
+  var lastImage   = ee.Image(listOfImages.get(listOfImages.length().subtract(1)));
+  
+  var source    = ee.Image(listOfImages.get(imgNumSource));
+  
+  var fill      = ee.Image(listOfImages.get(imgNumFill));
+  
+  
+  // take images from the same WRS path and +/- N months
+  var fillImages = l7images
+    //.filter(ee.Filter.eq('WRS_PATH', firstImage.get('WRS_PATH')))
+    .filterDate(source.date().advance(-3, 'month'), source.date().advance(3, 'month'));
+  
+    // check if we're getting images which fill SLC-OFF gaps by comparing masks
+    fillImages = fillImages.map(function(i) {
+      var xorMask = i.select(0).mask().and(source.select(0).mask().not());
+      
+      var area = ee.Image.pixelArea().mask(xorMask).reduceRegion({
+        reducer: ee.Reducer.sum(), 
+        geometry: source.geometry(), 
+        scale: 300, 
+      }).values().get(0);
+      
+      return i.set({ gapArea: area });
+    });
+  
+  var fill = fillImages.sort('gapArea', false).first();
+  
+  var vis = {min:0, max:20000, gamma: 0.85, bands:["B3", "B2", "B1"]};
+  
+  //Map.addLayer(fill,    vis, "1 " + year, 0);
+  //Map.addLayer(source,  vis, "2 " + year, 0);
+  print(source,'First '+ year);
+  print(fill,'Second '+ year);
+  
+  //Map.addLayer(fill,    vis, "fill "+ year, false);
+  //Map.addLayer(source,  vis, "destination " + year, false);
+  var result = GapFill(source, fill, 30, false);
+  //Map.addLayer(result,  vis, "filled " + year, false);
+
+  var resultUpscaled = GapFill(source, fill, 30, true);
+  Map.addLayer(resultUpscaled,  vis, "filled (upscaled) " + year, 0);
+  print('result upscaled ' + year, resultUpscaled);
+  
+return resultUpscaled;
+};
+
+//You can do this for as many years as you have imagery for, but it is unnecessary before 2003
+var slc2003 = SLCcorrection(l7SnowFree, '2003-08-01', '2003-10-31', 0, 1, '2003');
+var slc2004 = SLCcorrection(l7SnowFree, '2004-08-01', '2004-10-31', 0, 1, '2004');
+var slc2005 = SLCcorrection(l7SnowFree, '2005-08-01', '2005-10-31', 0, 1, '2005');
+var slc2006 = SLCcorrection(l7SnowFree, '2006-08-01', '2006-10-31', 0, 1, '2006');
+var slc2007 = SLCcorrection(l7SnowFree, '2007-08-01', '2007-10-31', 0, 1, '2007');
+var slc2008 = SLCcorrection(l7SnowFree, '2008-08-01', '2008-10-31', 0, 1, '2008');
+var slc2009 = SLCcorrection(l7SnowFree, '2009-08-01', '2009-10-31', 0, 1, '2009');
+var slc2010 = SLCcorrection(l7SnowFree, '2010-08-01', '2010-10-31', 0, 1, '2010');
+var slc2011 = SLCcorrection(l7SnowFree, '2011-08-01', '2011-10-31', 0, 1, '2011');
+var slc2012 = SLCcorrection(l7SnowFree, '2012-08-01', '2012-10-31', 0, 1, '2012');
+var slc2013 = SLCcorrection(l7SnowFree, '2013-08-01', '2013-10-31', 0, 1, '2013');
+var slc2014 = SLCcorrection(l7SnowFree, '2014-08-01', '2014-10-31', 0, 1, '2014');
+var slc2015 = SLCcorrection(l7SnowFree, '2015-08-01', '2015-10-31', 0, 1, '2015');
+var slc2016 = SLCcorrection(l7SnowFree, '2016-08-01', '2016-10-31', 0, 1, '2016');
+var slc2017 = SLCcorrection(l7SnowFree, '2017-08-01', '2017-10-31', 0, 1, '2017');
+var slc2018 = SLCcorrection(l7SnowFree, '2018-08-01', '2018-10-31', 0, 1, '2018');
+var slc2019 = SLCcorrection(l7SnowFree, '2019-08-01', '2019-10-31', 0, 1, '2019');
+var slc2020 = SLCcorrection(l7SnowFree, '2020-08-01', '2020-10-31', 0, 1, '2020');
+var slc2021 = SLCcorrection(l7SnowFree, '2021-08-01', '2021-10-31', 0, 1, '2021');
+var slc2022 = SLCcorrection(l7SnowFree, '2022-08-01', '2022-10-31', 0, 1, '2022');

@@ -414,6 +414,7 @@ print('2024 image composite', composite2024);
 
 //Notice we have no class 0 (water), and we have it masked out earlier
 //Remove this if you are classifying water
+//You may have a different number of classes for analysis, this is where you would edit those numbers.
 var classesNW = classes.filter(ee.Filter.inList('Class', [1, 2, 3, 4, 5, 6])); //<- making sure water is gone
 print('classes w water', classes);     //<- print both w and w/o water to check differences
 print('classes w/o water', classesNW); //<- print both w and w/o water to check differences

@@ -1,0 +1,447 @@
+////////////////////////////////////////////////////////////
+///////////LET'S MAKE SOME TRAINING DATA///////////////////
+//////////////////////////////////////////////////////////
+
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//This script is for creating training data (TD) to feed to a classifier in another code.
+//You will need:
+    //a feature or feature collection that is the watershed boundary
+    //an outline of stable water bodies in the watershed (optional, but aids in classificaiton later)
+    //a good mouse
+    //a good playlist, you'll be here for a while
+//You may find it helpful to have this script copied for each satellite you are using
+//HAVE FUN! :) //
+//////////////////////////////////////////////////////////////////////////////////////
+
+//Start by adding your watershed boundary and waterbodies to your imports//
+//access your boundary in your assests tab (you can look up how to add an shp to your assests)
+
+//Here we are setting the map center over the study area
+Map.setCenter(-148.88725, 60.35079, 11); //<-- lat lon of study area and zoom level 
+Map.setOptions({mapTypeId: 'HYBRID'}); // <- sets the baselayer to satellite imagery with labels
+
+// Add ROI and set your date to find imagery
+var roi = ee.Geometry.Point(-148.921745, 60.379588); //<-- Wolverine Glacier
+var date_i = '1984-03-01'; //<- you will need start and end times for filtering imagery, set initial date (YYYY-MM-DD)
+var date_f = '2022-10-31'; // Set final date (YYY-MM-DD)
+
+//add an outline of the Nellie Juan Watershed to visualize the study area
+var styling = {color: 'black', width: 4, fillColor: 'FF000000'}; //<- create a black outline of the study area
+Map.addLayer(watershed.style(styling), null, 'nj_wtrshd');// <- add the outline to the map
+
+
+///////////////////////////////////////////////////////////////
+///////////Landsat 8 Workflow for the Nellie Juan//////////////
+///////////////////////////////////////////////////////////////
+//This step is not entirely necessary, but is certainly helpful. 
+//We are gathering Landsat 8 data and running an unsupervised classification to help us select training points
+//This is, in essence, the first major steps of the classification, but simplified for unsupervised classification
+
+
+//If you want to skip the unsupervised classification then you can comment out the majority of this section (to line ~360) and just
+//create your training points from imagery in the map viewer
+
+
+
+// add landsat imagery, filter by cloud cover over land, only select spectral bands, and filter by roi and specified date range
+var l8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2") //<- Landsat 8 Surface Reflectance Data
+  .filterDate(date_i, date_f) // <- filter the date range to the input start and end
+  .filter(ee.Filter.calendarRange(8, 10, 'month')) //<- filter by months to get a specific season
+  .filterBounds(roi) //<- filter the collection by your study area (DO NOT LEAVE THIS BLANK)
+  .select( 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7') //<- selecting the bands we want to use, these are all spectral
+  .filter(ee.Filter.lte('CLOUD_COVER_LAND', 25)); //<- only take images with less than X% cloud cover
+print('l8', l8); //<- print to the console to make sure it worked
+
+
+//Now we make the imagery pretty:
+//add a visualization parameter for the landsat imagery to display in the map if wanted
+var l8VisParams = {bands: ['B4', 'B3', 'B2'], min: 0, max: 40000, gamma: [1, 1, 1]}; //<- creates a callable style for visualization, note band names are different than above
+
+//add SRTM data, clip it to the the Nellie Juan, select only the elevation band, and then derive slope and aspect as separate images
+var DEM = ee.Image("NASA/NASADEM_HGT/001").clip(watershed.geometry()).select('elevation'); //<- get a DEM of similar spatial resolution
+var slope = ee.Terrain.slope(DEM); //<- calculate slope from DEM
+var aspect = ee.Terrain.aspect(DEM); //<- calculate aspect from DEM
+print('Elevation', DEM); // <- print topography to console to check if it worked
+print('Slope', slope); //<- printing helps to check for data continuity without having to visualize rasters
+print('Aspect', aspect);// <- saves a bit of time, saves a lot of headache
+
+
+//////////////Here we are starting a topographic correction for the Landsat data
+//////////////This helps with shadows and deep canyons, but also creates data continuity when selecting TD
+var demClip = watershed; //<- set a clipping area for the DEM to the watershed outline
+
+var oliBands = ['SR_B2',   'SR_B3',    'SR_B4',  'SR_B5',  'SR_B6',    'SR_B7']; //<- Define Landsat bands to use
+var defBands = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2']; //<- give the bands a more common name
+                                                              //These are dictionaries to be called later, they don't do anything here
+
+var l8cor = l8.select(oliBands, defBands);//<- select bands in landsat data and rename them
+print('l8cor', l8cor);//<- print out the imagery with defined bands
+
+
+//This is the meat of the topographic correction
+//We are using SCS+C algorith (Soenen et al., 2005). Code adapted from Spatial Thoughts Geo Blog
+
+//funtion to compute radians from degrees
+function radians(img) {
+  return img.toFloat().multiply(Math.PI).divide(180);}
+//Get DEM Slope and Aspect in radians
+var SLPrads = radians(slope);
+var ASPrads = radians(aspect);
+
+//function to do the terrain correction
+var scscTCl8 = function(img) {
+  var outImage = img.select([]);
+  
+  //Get the footprint image of the study area
+  var footprint = ee.Geometry.Polygon(ee.Number(ee.List(img.get('system:footprint'))));
+
+  //VARIABLES FROM METADATA
+  var AZ = ee.Number(img.get('SUN_AZIMUTH'));
+  var ZE = ee.Number(img.get('SUN_ELEVATION'));
+  var AZ_R = radians(ee.Image(AZ));
+  var ZE_R = radians(ee.Image(ZE));
+  
+  //CALCULATE LOCAL ILLUMINATION, COS OF THE SLOPE, AND COS OF THE ZENITH ANGLE
+  var IL = AZ_R.subtract(ASPrads).cos().multiply(SLPrads.sin()).multiply(ZE_R.sin())
+  .add(ZE_R.cos().multiply(SLPrads.cos()));
+  var cos_ZE = ZE_R.cos();
+  var cos_SLP = SLPrads.cos();
+  
+
+  //C for the blue band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultBlue = clippedImg.select('constant', 'constant_1', 'blue')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var blueC = (ee.Array(resultBlue.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultBlue.get('coefficients')).get([1,0]));
+  var blueCorr = ((cos_ZE.multiply(cos_SLP)).add(blueC)).divide(IL.add(blueC));
+
+  
+  //C for the green band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultGreen = clippedImg.select('constant', 'constant_1', 'green')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var greenC = (ee.Array(resultGreen.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultGreen.get('coefficients')).get([1,0]));
+  var greenCorr = ((cos_ZE.multiply(cos_SLP)).add(greenC)).divide(IL.add(greenC));
+  
+  //C for the red band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultRed = clippedImg.select('constant', 'constant_1', 'red')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var redC = (ee.Array(resultRed.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultRed.get('coefficients')).get([1,0]));
+  var redCorr = ((cos_ZE.multiply(cos_SLP)).add(redC)).divide(IL.add(redC));
+  
+  //C for the nir band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultNir = clippedImg.select('constant', 'constant_1', 'nir')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var nirC = (ee.Array(resultNir.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultNir.get('coefficients')).get([1,0]));
+  var nirCorr = ((cos_ZE.multiply(cos_SLP)).add(nirC)).divide(IL.add(nirC));
+  
+  //C for the swir1 band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultSwir1 = clippedImg.select('constant', 'constant_1', 'swir1')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var swir1C = (ee.Array(resultSwir1.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultSwir1.get('coefficients')).get([1,0]));
+  var swir1Corr = ((cos_ZE.multiply(cos_SLP)).add(swir1C)).divide(IL.add(swir1C));
+  
+  //C for the swir2 band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultSwir2 = clippedImg.select('constant', 'constant_1', 'swir2')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var swir2C = (ee.Array(resultSwir2.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultSwir2.get('coefficients')).get([1,0]));
+  var swir2Corr = ((cos_ZE.multiply(cos_SLP)).add(swir2C)).divide(IL.add(swir2C));
+  
+  //IMAGE CORRECTION
+  var InImg2 = img.multiply(0.0001);
+  
+  var blueBand = InImg2.select('blue').multiply(blueCorr);
+  //Map.addLayer(blueBand);
+  var greenBand = InImg2.select('green').multiply(greenCorr);
+  var redBand = InImg2.select('red').multiply(redCorr);
+  var nirBand = InImg2.select('nir').multiply(redCorr);
+  var swir1Band = InImg2.select('swir1').multiply(swir1Corr);
+  var swir2Band = InImg2.select('swir2').multiply(swir2Corr);
+  
+  var img_TC = img.select().addBands([blueBand, greenBand, redBand, nirBand, swir1Band, swir2Band]);
+  //print('img_TC', img_TC)
+  
+  //ADJUST VALUE RANGE (REFLECTANCE BETWEEN 0 AND 1)
+  var img_TC1 = ((img_TC.multiply(10000)).int16());//.multiply(0.0001);
+    
+  outImage = outImage.addBands(img_TC1
+  .select([0,1,2,3,4,5],['blue_TC', 'green_TC', 'red_TC', 'nir_TC', 'swir1_TC', 'swir2_TC']));
+  return outImage;
+};
+
+var l8corCol = l8cor.map(scscTCl8); //<- map the correction over your image collection
+print('l8 corrected col', l8corCol);
+
+var renameBands = function(image){ //<- rename the bands in the new imagery to make them shorter
+  return image.select(['blue_TC', 'green_TC', 'red_TC', 'nir_TC', 'swir1_TC', 'swir2_TC'])//<- make sure you know your bands and what they are!!
+  .rename(['B2', 'B3', 'B4', 'B5', 'B6', 'B7']);
+};
+
+var l8renamed = l8corCol.map(renameBands); //<- Map renaming function over image collection
+print('RENAMED L8', l8renamed);
+
+// create a function to clip each image in the image collection to the Nellie Juan
+var clipping = function(image) { 
+  return image.clip(watershed); //<- clip all of the imagery to the study area
+};
+
+// Apply clipping function to l8 data
+var l8_clip = l8renamed.map(clipping);//<- map your clipping function over imagery
+print('l8 clipped', l8_clip);
+
+// create a function to add the DEM elevation, slope, and aspect bands to the landsat images
+var addDEM = function(image){
+  return image.addBands(DEM).addBands(slope).addBands(aspect);
+};
+
+//apply the addDEM function to each image in the collection
+var l8DEM = l8_clip.map(addDEM);
+print('l8 + DEM', l8DEM);
+
+//create a water mask using NHD waterbodies polygons
+//Here we need those water polygons
+var njWaterImg = waterbodies.reduceToImage(['fid'], ee.Reducer.sum()).clip(watershed.geometry());  //<- reduce polygons to a raster format
+var mask = njWaterImg.select('sum').neq(0); //<- create a mask of water polygons
+var waterMask = mask.not(); //<- invert the mask so that it is in the correct format
+print('Water Mask', waterMask);
+
+//create a function to apply the water mask to the composited imagery
+var applyMask = function(image){
+  return image.updateMask(waterMask); 
+};
+
+//apply the water masking function to the composited imagery
+var l8Masked = l8DEM.map(applyMask); //<- get that water out of your imagery!
+print('Masked L8 Imagery', l8Masked);
+
+//create a function to generate an NDSI and NDVI on the imagery
+var createNDSI = function(image){
+  var NDSI = image.normalizedDifference(['B3', 'B6']).rename('NDSI'); //<- Normalized Difference Snow Index
+  var NDVI = image.normalizedDifference(['B5', 'B4']).rename('NDVI'); //<- Normalized Difference Vegetation Index
+  return image.addBands(NDSI).addBands(NDVI);
+};
+
+//apply the NDSI and NDVI creation function to the imagery
+var l8NDI = l8Masked.map(createNDSI);
+print('L8 + Indices', l8NDI);
+
+
+//create a function to look over imagery and only select the most snow free images,
+//this is to account for early snowfall and filter out those images with excess snow
+    ///////This can get wonky. If you have just a few images it may be easier to visualize them and manually select images.
+//this function will count the number of snow free pixels
+var NDSIth = function(image){
+  var getNDSI = image.select('NDSI').lte(0.4).selfMask().rename('NDSIth'); //<- take the NDSI and look for pixels over a threshold value
+  var pixelCount = getNDSI.reduceRegion({reducer: ee.Reducer.count(), geometry: watershed.geometry(), scale: 30, bestEffort: true, maxPixels: 6700000});//<- count high NDSI pixels
+  return image.addBands(getNDSI).set('NDSIcount', pixelCount.get('NDSIth')); //<- add the count of snowy pixels to imagery
+};
+
+//map the function to get the count of pixels that are snow over the image collection
+var l8SnowCount = l8NDI.map(NDSIth);
+print('l8 w snowy pixel count', l8SnowCount);
+
+//this function will pass over the image collection and only keep images with a defined number of 
+//snow free pixels
+//You should calculate a rough estimate of how much snow you should have based off of watershed area and imagery spatial resolution
+var l8SnowFree = l8SnowCount.filter(ee.Filter.lte('NDSIcount', 2100000)); //<- kick out images with a snowy pixel count higher than what you decide is necessary
+l8SnowFree = l8SnowFree.select('B2', 'B3', 'B4', 'B5', 'B6', 'B7', //^ be careful, you can easily over/under estimate your threshold here
+  'elevation', 'slope', 'aspect', 'NDSI', 'NDVI');
+print('l8 snow free images', l8SnowFree);
+
+print('Everything Above Here ^^^ Is Checking Your Data Preparation')
+///////////////////CONGRATULATIONS, YOUR DATA IS NOW PREPPED FOR CLASSIFICATION///////////////////
+
+//This takes imagery after prep and uses a median pixel value to create a single composite image
+//regardless of there being multiple images in a year or just one
+var composite2014 = l8SnowFree.filter(ee.Filter.date('2014-01-01', '2014-12-31')).median();
+print('2014 image composite', composite2014);
+var composite2015 = l8SnowFree.filter(ee.Filter.date('2015-01-01', '2015-12-31')).median();
+print('2015 image composite', composite2015);
+var composite2016 = l8SnowFree.filter(ee.Filter.date('2016-01-01', '2016-12-31')).median();
+print('2016 image composite', composite2016);
+var composite2017 = l8SnowFree.filter(ee.Filter.date('2017-01-01', '2017-12-31')).median();
+print('2017 image composite', composite2017);
+var composite2018 = l8SnowFree.filter(ee.Filter.date('2018-01-01', '2018-12-31')).median();
+print('2018 image composite', composite2018);
+var composite2019 = l8SnowFree.filter(ee.Filter.date('2019-01-01', '2019-12-31')).median();
+print('2019 image composite', composite2019);
+var composite2020 = l8SnowFree.filter(ee.Filter.date('2020-01-01', '2020-12-31')).median();
+print('2020 image composite', composite2020);
+var composite2021 = l8SnowFree.filter(ee.Filter.date('2021-01-01', '2021-12-31')).median();
+print('2021 image composite', composite2021);
+var composite2022 = l8SnowFree.filter(ee.Filter.date('2022-01-01', '2022-12-31')).median();
+print('2022 image composite', composite2022);
+/////////This is a good place to start adding images to the map to see how things look
+//Map.addLayer(composite2016, l8VisParams, 'L8 Composite Image: 2016')
+
+
+/////////////NOW WE ARE STARTING AN UNSUPERVISED CLASSIFICATION//////////////////////
+//There are a few ways to perform these classifications in GEE, I prefer Xmeans or Kmeans, but play around with others
+
+var imageToClassify = composite2021//<- pick an image to classify
+print('Image we are classifying', imageToClassify);
+Map.addLayer(imageToClassify, l8VisParams, 'Image we are classifying');
+
+//var mask = imageToClassify.select('NDSI').gte(0.4); //<- an optional mask to input to data if you want to keep out certain landcover
+
+var training = imageToClassify.sample({ //<-- create your training data by sampling over imagery
+  region: watershed, //<- where are we sampling?
+  scale: 30, //<- how big are our pixels?
+  tileScale: 2, //<- how detailed do we want our data? (keep this below 4)
+  numPixels: 10000 //<- how many training points do we want?
+});
+
+//create a classifier: check the Reference Docs for specific inputs for each classifier
+var kmeans = ee.Clusterer.wekaKMeans(7).train(training); //<- create a classifier using training data
+var xmeans = ee.Clusterer.wekaXMeans(4, 10).train(training); //<- numbers indicate how many classes the classifier should look for
+//var lvq = ee.Clusterer.wekaLVQ(10).train(training);
+//var cascade = ee.Clusterer.wekaCascadeKMeans(10).train(training);
+//var cobweb = ee.Clusterer.wekaCobweb().train(training);
+
+//Run the classifier to actually create the data
+var result_unsupervisedKmeans = composite2016.cluster(kmeans); //<- add the optional mask with .mask(snowMask) after calling your image
+var result_unsupervisedXmeans = composite2021.cluster(xmeans); //<- add the optional mask with .mask(snowMask) after calling your image
+//var result_unsupervisedLVQ = composite2021.mask(snowMask).cluster(lvq);
+//var result_unsupervisedCascade = composite2021.mask(snowMask).cluster(cascade);
+//var result_unsupervisedCobweb = composite2021.mask(snowMask).cluster(cobweb);
+
+var unsupervisedVis = {min: 1, max: 10, // <- visualization parameters for unsupervised classification
+    'palette': ['#138D75', '#27AE60', '#58D68D', '#F4D03F', '#F5B041', '#D35400', '#C0392B', '#9B59B6', '#AED6F1', '#1F618D']};
+  
+Map.addLayer(result_unsupervisedKmeans, unsupervisedVis, 'unsupervised classification K Means');
+print('unsupervised classification K Means', result_unsupervisedKmeans);
+Map.addLayer(result_unsupervisedXmeans, unsupervisedVis, 'unsupervised classification X Means');
+print('unsupervised classification X Means', result_unsupervisedXmeans);
+//Map.addLayer(result_unsupervisedLVQ, unsupervisedVis, 'unsupervised classification LVQ');
+//print('unsupervised classification LVQ', result_unsupervisedLVQ);
+//Map.addLayer(result_unsupervisedCascade, unsupervisedVis, 'unsupervised classification Cascade');
+//print('unsupervised classification Cascade', result_unsupervisedCascade);
+//Map.addLayer(result_unsupervisedCobweb, unsupervisedVis, 'unsupervised classification Cobweb');
+//print('unsupervised classification Cobweb', result_unsupervisedCobweb);
+
+
+///////////////////////////YOU DID IT, THE IMAGERY IS CLASSIFIED/////////////////////
+//Now you can use the classified imagery to help you select training data more effectively
+//You need to click points on the map that correspond to classes you want to classify
+//click on the bubble point icon in the top left corner of the map viewer to create a feature collection you can edit
+//click as many points as you think are necessary for each class you are classifiying
+//Belgiu and Dragu, Foody, and Rodriguez-Galiano papers are helpful for this
+
+//get that playlist going, you're going to be here a while
+
+//create feature collections for each multipoint class
+//each of these are for classes I used in classification, you can make them whatever you want
+//Make sure that class names are representative of landcover and match your outputs in this section
+//water
+var geoWater = water.geometries();
+var featWater = geoWater.map(function(w){
+  return ee.Feature(ee.Geometry(w)).set('Landcover', 'Water').set('Class', 0);
+});
+print('featWater', featWater);
+var colWater = ee.FeatureCollection(featWater);
+print('colWater', colWater);
+
+//snow_ice
+var geoSnow = snow.geometries();
+var featSnow = geoSnow.map(function(w){
+  return ee.Feature(ee.Geometry(w)).set('Landcover', 'Snow and Ice').set('Class', 1);
+});
+print('featSnow', featSnow);
+var colSnow = ee.FeatureCollection(featSnow);
+print('colSnow', colSnow);
+
+//bareRock
+var geoRock = rock.geometries();
+var featRock = geoRock.map(function(w){
+  return ee.Feature(ee.Geometry(w)).set('Landcover', 'Bare Ground').set('Class', 2);
+});
+print('featRock', featRock);
+var colRock = ee.FeatureCollection(featRock);
+print('colRock', colRock);
+
+//forest
+var geoForest = forest.geometries();
+var featForest = geoForest.map(function(w){
+  return ee.Feature(ee.Geometry(w)).set('Landcover', 'Forest').set('Class', 3);
+});
+print('featForest', featForest);
+var colForest = ee.FeatureCollection(featForest);
+print('colForest', colForest);
+
+//shrub
+var geoShrub = shrub.geometries();
+var featShrub = geoShrub.map(function(w){
+  return ee.Feature(ee.Geometry(w)).set('Landcover', 'Shrub').set('Class', 4);
+});
+print('featShrub', featShrub);
+var colShrub = ee.FeatureCollection(featShrub);
+print('colShrub', colShrub);
+
+//tundra
+var geoTundra = tundra.geometries();
+var featTundra = geoTundra.map(function(w){
+  return ee.Feature(ee.Geometry(w)).set('Landcover', 'Tundra or Meadow').set('Class', 5);
+});
+print('featTundra', featTundra);
+var colTundra = ee.FeatureCollection(featTundra);
+print('colTundra', colTundra);
+
+//forbs
+var geoforbs = forbs.geometries();
+var featforbs = geoForbs.map(function(w){
+  return ee.Feature(ee.Geometry(w)).set('Landcover', 'Forbs').set('Class', 6);
+});
+print('featForbs', featForbs);
+var colForbs = ee.FeatureCollection(featForbs);
+print('colForbs', colForbs);
+
+//combine all classes into a single feature collection to be flattened and add random column
+var allClasses = ee.FeatureCollection([colWater, colSnow, colRock, colForest, colShrub, colTundra, colSparseTundra])
+                                      .flatten().randomColumn(); //<- flatten to remove unecessary data, add random column for splitting later
+print('allClasses', allClasses);
+Map.addLayer(allClasses);
+var label = 'Class'; //<- create data label
+Export.table.toAsset({collection: allClasses, //<- export data to an asset in your Earth Engine Account
+                      description: 'TrainingDataExportToAsset', //<- a description of the export task
+                      assetId: 'Landsat8TrainingData'}); //<- the actual file name. Make sure it's descriptive!!!!!

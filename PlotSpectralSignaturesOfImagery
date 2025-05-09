@@ -1,0 +1,460 @@
+//This code is to calculate spectral responses of training data and imagery 
+////to see if there are differences across satellites
+
+//You will need:
+    //training points you use on a particular sensor
+    //a classified image from your earlier classification
+    //a reference image of composited or raw Landsat surface reflectance
+  //For example: You will have a composited Landsat 8 image for 2021, a classified image from 2021,
+  ////and training data for Landsat 8 (repeated for each sensor)
+//This script uses data from all Landsat sensors at once to make comparable comparisons between sensors
+
+//There are 2 distinct processes here: 1. sampling over imagery with random points and seeing how things look (spectrally) across the imagery
+////and 2. looking at spectral responses of imagery under training data that you created 
+
+//Heads up: we are asking GEE to do something it is not optimized for which is tabular data.
+//This code will probably take a while to run and will perform slowly, you can help by
+////not printing information too often or unnecessarilly
+
+//First step: insert you training data, classified image, and reference image as imports to the script
+
+
+//Lets start by visualizing our imagery. Add a classified and composited image from each year to the map
+Map.addLayer(img86, {bands: ['B3', 'B2', 'B1'], min: 0, max: 20000}, 'Landsat 5 1986', 0);
+Map.addLayer(img02, {bands: ['B3', 'B2', 'B1'], min: 0, max: 20000}, 'Landsat 7 2002', 0);
+Map.addLayer(img21, {bands: ['B4', 'B3', 'B2'], min: 0, max: 20000}, 'Landsat 8 2021', 0);
+Map.addLayer(class21, {min: 1, max: 6, 
+  'palette': ['E0E0E0', '45414E', '0E5B07', 'CE6C47', 'FFC145', 'E14607']
+  }, 'Classified Image 2021', 0);
+Map.addLayer(class02, {min: 1, max: 6, 
+  'palette': ['E0E0E0', '45414E', '0E5B07', 'CE6C47', 'FFC145', 'E14607']
+  }, 'Classified Image 2002', 0);
+Map.addLayer(class86, {min: 1, max: 6, 
+  'palette': ['E0E0E0', '45414E', '0E5B07', 'CE6C47', 'FFC145', 'E14607']
+  }, 'Classified Image 1986', 0);
+
+
+//define your classes, these are for the Nellie Juan but can be changed to match your training data
+var classNames = ee.List(['water', 'snow', 'rock', 'forest', 'shrub', 'forbs', 'heath']);
+
+
+var bandDescriptionsL8 = { //<- band descriptions for Landsat 8 OLI and Indices
+  'B2': 'B02/Blue 0.452-0.512',
+  'B3': 'B03/Green 0.533-0.590',
+  'B4': 'B04/Red 0.636-0.673',
+  'B5': 'B05/NIR 0.851-0.879',
+  'B6': 'B06/SWIR1 1.566-1.651',
+  'B7': 'B07/SWIR2 2.107-2.294',
+  'elevation': 'Elevation',
+  'slope': 'Slope',
+  'aspect': 'Aspect',
+  'NDVI': 'NDVI',
+  'NDSI': 'NDSI'
+};
+
+var bandDescriptionsL5 = {//<- band descriptions for Landsat 5 TM and 7 ETM+ and Indices
+  'B1': 'B01/Blue 0.45-0.52',
+  'B2': 'B02/Green 0.52-0.60',
+  'B3': 'B03/Red 0.63-0.69',
+  'B4': 'B04/NIR 0.77-0.9',
+  'B5': 'B05/SWIR1 1.55-1.75',
+  'B7': 'B07/SWIR2 2.08-2.35',
+  'elevation': 'Elevation',
+  'slope': 'Slope',
+  'aspect': 'Aspect',
+  'NDVI': 'NDVI',
+  'NDSI': 'NDSI'
+};
+
+
+//This section is to get a sample of points from the image, not the training data, for comparison
+//We do this via a stratified random sampling of the classified imagery to create random points
+//We start with data for 2021
+var sampledClass21 = class21.stratifiedSample({numPoints: 400,
+  classBand: 'classification', 
+  scale: 30,
+  dropNulls: true,
+  geometries: true
+});
+//print('stratified Sample of Class 2021', sampledClass21);
+//Map.addLayer(sampledClass21, {}, 'class 2021 strat sample', 0);
+
+//for Landsat 7 data
+var sampledClass02 = class02.stratifiedSample({numPoints: 400,
+  classBand: 'classification', 
+  scale: 30,
+  dropNulls: true,
+  geometries: true
+});
+//print('stratified Sample of Class 2002', sampledClass02);
+//Map.addLayer(sampledClass02, {}, 'class 2002 strat sample', 0);
+
+//for Landsat 5 data
+var sampledClass86 = class86.stratifiedSample({numPoints: 400,
+  classBand: 'classification', 
+  scale: 30,
+  dropNulls: true,
+  geometries: true
+});
+//print('stratified Sample of Class 1986', sampledClass86);
+//Map.addLayer(sampledClass86, {}, 'class 1986 strat sample', 0);
+
+
+
+//now we need to take those points we just created and reduce them over the pixels of the composited image
+//put stratified points over input imagery to reduce pixels
+var StratifiedTraining21 = img21.sampleRegions({
+  collection: sampledClass21,
+  properties: ['classification'],
+  scale: 30
+});
+//print('stratified samples training data 2021', StratifiedTraining21);
+
+//put stratified points over input imagery to reduce pixels for 2002
+var StratifiedTraining02 = img02.sampleRegions({
+  collection: sampledClass02,
+  properties: ['classification'],
+  scale: 30
+});
+//print('stratified samples training data 2002', StratifiedTraining02);
+
+//put stratified points over input imagery to reduce pixels for 1986
+var StratifiedTraining86 = img86.sampleRegions({
+  collection: sampledClass86,
+  properties: ['classification'],
+  scale: 30
+});
+//print('stratified samples training data 1986', StratifiedTraining86);
+
+
+//now we need to see how each point responds within each band. We need to sample data over each band and
+//for X number of bands, the process needs to happen X number of times.
+//We are indexing the data by landocver property (or Class) to group the reuslts
+var bands21 = img21.bandNames();
+//print('bands 2021', bands21);
+var numBands21 = bands21.length();
+//print('numBands 2021', numBands21);
+var bandsWithClass21 = bands21.add('classification');
+//print('bandsWithClass 2021', bandsWithClass21);
+var classIndex21 = bandsWithClass21.indexOf('classification');
+//print('classIndex 2021', classIndex21);
+
+//for Landsat 7
+var bands02 = img02.bandNames();
+//print('bands 2002', bands02);
+var numBands02 = bands02.length();
+//print('numBands 2002', numBands02);
+var bandsWithClass02 = bands02.add('classification');
+//print('bandsWithClass 2002', bandsWithClass02);
+var classIndex02 = bandsWithClass02.indexOf('classification');
+//print('classIndex 2002', classIndex02);
+
+//for Landsat 5
+var bands86 = img86.bandNames();
+//print('bands 1986', bands86);
+var numBands86 = bands86.length();
+//print('numBands 1986', numBands86);
+var bandsWithClass86 = bands86.add('classification');
+//print('bandsWithClass 1986', bandsWithClass86);
+var classIndex86 = bandsWithClass86.indexOf('classification');
+//print('classIndex 1986', classIndex86);
+
+//Now lets calculate the mean and standard deviations for the signatures. We are 
+//using combine command to get reducer to do multiple stats for a single input
+//This makes an empty reducer function to apply later
+var combinedReducer = ee.Reducer.mean().combine({
+  reducer2: ee.Reducer.stdDev(),
+  sharedInputs: true
+});
+
+
+
+//Now we apply the reducer to the sampled imagery to get the spectral stats
+//retrieve point stats for 2021 data
+var pointsStats21 = StratifiedTraining21.reduceColumns({
+  selectors: bands21.add('classification'),
+  reducer: combinedReducer.repeat(numBands21).group(classIndex21) //<- repeat the reducer for each band
+});
+//print('pointsStats 2021', pointsStats21);
+
+//for Landsat 7
+var pointsStats02 = StratifiedTraining02.reduceColumns({
+  selectors: bands02.add('classification'),
+  reducer: combinedReducer.repeat(numBands02).group(classIndex02)
+});
+//print('pointsStats 2002', pointsStats02);
+
+//for Landsat 5
+var pointsStats86 = StratifiedTraining86.reduceColumns({
+  selectors: bands86.add('classification'),
+  reducer: combinedReducer.repeat(numBands86).group(classIndex86)
+});
+//print('pointsStats 1986', pointsStats86);
+
+
+
+//the above outputs are a dictionary, so we need to extract values for each year
+var groups21 = ee.List(pointsStats21.get('groups'));
+//print('groups 2021', groups21);
+
+//for Landsat 7
+var groups02 = ee.List(pointsStats02.get('groups'));
+//print('groups 2002', groups02);
+
+//for Landsat 5
+var groups86 = ee.List(pointsStats86.get('groups'));
+//print('groups 1986', groups86);
+
+
+
+//Now we can combine all of the numbers from above for a year into a single CSV for plotting in the console
+//create a feature class that is averaged data in each grouping
+var fc21 = ee.FeatureCollection(groups21.map(function(item) {
+  //get the mean values
+  var values = ee.Dictionary(item).get('mean'); //<- get the mean spectral response
+  var groupNumber = ee.Dictionary(item).get('group'); //<- group the numbers by class
+  var properties = ee.Dictionary.fromLists(bands21, values); //<- assign numbers to bands
+  var withClass = properties.set('class', classNames.get(groupNumber)); //<- finalize groupings
+  return ee.Feature(null, withClass); //<- parse over each class in the classNames List
+}));
+
+//for Landsat 7
+var fc02 = ee.FeatureCollection(groups02.map(function(item) {
+  //get the mean values
+  var values = ee.Dictionary(item).get('mean');
+  var groupNumber = ee.Dictionary(item).get('group');
+  var properties = ee.Dictionary.fromLists(bands02, values);
+  var withClass = properties.set('class', classNames.get(groupNumber));
+  return ee.Feature(null, withClass);
+}));
+
+//for Landsat 5
+var fc86 = ee.FeatureCollection(groups86.map(function(item) {
+  //get the mean values
+  var values = ee.Dictionary(item).get('mean');
+  var groupNumber = ee.Dictionary(item).get('group');
+  var properties = ee.Dictionary.fromLists(bands86, values);
+  var withClass = properties.set('class', classNames.get(groupNumber));
+  return ee.Feature(null, withClass);
+}));
+
+
+
+////function to export the feature class for processing out of GEE (note: it shrinks the charts in the console
+////so it is good to comment out when not using)
+//Export.table.toDrive({
+//  collection: fc21,
+//  description: '2021_Stratified_Spectral_Sigs_classes_by_band', //<- change the name for the year of your data
+//  folder: 'SpectralSigs',
+//  fileFormat: 'CSV'
+//});
+//
+////for Landsat 7
+//Export.table.toDrive({
+//  collection: fc02,
+//  description: '2002_Stratified_Spectral_Sigs_classes_by_band',
+//  folder: 'SpectralSigs',
+//  fileFormat: 'CSV'
+//});
+//
+////for Landsat 5
+//Export.table.toDrive({
+//  collection: fc86,
+//  description: '1986_Stratified_Spectral_Sigs_classes_by_band',
+//  folder: 'SpectralSigs',
+//  fileFormat: 'CSV'
+//});
+
+//Now we are charting the spectral responses in the console by class
+//This is data prep but not actually creating a chart yet, that comes later
+var options21 = {
+  title: '2021 Mean Spectral Signatures',
+  hAxis: {title: 'Bands'}, //<- x axis title
+  vAxis: {title: 'Reflectance'}, //<- y axis title
+  lineWidth: 1,
+  pointSize: 4,
+  series: {
+    //0: {color: '1E41C6'}, //<- we don't care about water here so I comment it out
+    0: {color: 'E0E0E0'},  //<- charting has to start from 0 to count upwards
+    1: {color: '45414E'},
+    2: {color: '0E5B07'},
+    3: {color: 'CE6C47'},
+    4: {color: 'FFC145'},
+    5: {color: 'f23333'}
+  }
+};
+
+var options02 = {
+  title: '2002 Mean Spectral Signatures',
+  hAxis: {title: 'Bands'},
+  vAxis: {title: 'Reflectance'},
+  lineWidth: 1,
+  pointSize: 4,
+  series: {
+    //0: {color: '1E41C6'},
+    0: {color: 'E0E0E0'},
+    1: {color: '45414E'},
+    2: {color: '0E5B07'},
+    3: {color: 'CE6C47'},
+    4: {color: 'FFC145'},
+    5: {color: 'f23333'}
+  }
+};
+
+var options86 = {
+  title: '1986 Mean Spectral Signatures',
+  hAxis: {title: 'Bands'},
+  vAxis: {title: 'Reflectance'},
+  lineWidth: 1,
+  pointSize: 4,
+  series: {
+    //0: {color: '1E41C6'},
+    0: {color: 'E0E0E0'},
+    1: {color: '45414E'},
+    2: {color: '0E5B07'},
+    3: {color: 'CE6C47'},
+    4: {color: 'FFC145'},
+    5: {color: 'f23333'}
+  }
+};
+
+
+
+//We set up the data above, now it prints
+//here is the first actual chart generation
+//This is the average spectral response for each band connected by class
+var chart21 = ui.Chart.feature.byProperty({
+  features: fc21,
+  xProperties: bandDescriptionsL8,
+  seriesProperty: 'class'
+}).setChartType('ScatterChart').setOptions(options21);
+
+print(chart21);
+
+//for 2002
+var chart02 = ui.Chart.feature.byProperty({
+  features: fc02,
+  xProperties: bandDescriptionsL5,
+  seriesProperty: 'class'
+}).setChartType('ScatterChart').setOptions(options02);
+
+print(chart02);
+
+//for 1986
+var chart86 = ui.Chart.feature.byProperty({
+  features: fc86,
+  xProperties: bandDescriptionsL5,
+  seriesProperty: 'class'
+}).setChartType('ScatterChart').setOptions(options86);
+
+print(chart86);
+
+
+
+//This is where we create the multiple charts for each class and can see each training pixel
+var classChart21 = function(Class, label, color){
+  var options = {
+    title: '2021 Spectral Signatures for ' + label + ' Class',
+    hAxis: {title: 'Bands'},
+    vAxis: {title: 'Reflectance'},
+    lineWidth: 1,
+    pointSize: 4,
+  };
+  
+  var fc21 = StratifiedTraining21.filter(ee.Filter.eq('classification', Class));
+  ////Export your table to Drive so you can chart outside of GEE if desired
+  ////Comment out when you're not using this so that the charts don't shrink
+  //Export.table.toDrive({
+  //collection: fc21,
+  //description: '2021_Stratified_Spectral_Sigs_for_' + label,
+  //folder: 'SpectralSigs',
+  //fileFormat: 'CSV'
+  //});
+  var chart21 = ui.Chart.feature.byProperty({
+    features: fc21,
+    xProperties: bandDescriptionsL8,
+  }).setChartType('ScatterChart').setOptions(options);
+  
+print(chart21);
+};
+
+//classChart(0, 'Water');
+classChart21(1, 'Snow');
+classChart21(2, 'Rock');
+classChart21(3, 'Forest');
+classChart21(4, 'Shrub');
+classChart21(5, 'Forbs');
+classChart21(6, 'Heath');
+
+
+//for Landsat 7
+var classChart02 = function(Class, label, color){
+  var options = {
+    title: '2002 Spectral Signatures for ' + label + ' Class',
+    hAxis: {title: 'Bands'},
+    vAxis: {title: 'Reflectance'},
+    lineWidth: 1,
+    pointSize: 4,
+  };
+  
+  var fc02 = StratifiedTraining02.filter(ee.Filter.eq('classification', Class));
+  ////Export your table to Drive so you can chart outside of GEE if desired
+  ////Comment out when you're not using this so that the charts don't shrink
+  //Export.table.toDrive({
+  //collection: fc02,
+  //description: '2002_Stratified_Spectral_Sigs_for_' + label,
+  //folder: 'SpectralSigs',
+  //fileFormat: 'CSV'
+  //});
+  var chart02 = ui.Chart.feature.byProperty({
+    features: fc02,
+    xProperties: bandDescriptionsL5,
+  }).setChartType('ScatterChart').setOptions(options);
+  
+print(chart02);
+};
+
+//classChart(0, 'Water');
+classChart02(1, 'Snow');
+classChart02(2, 'Rock');
+classChart02(3, 'Forest');
+classChart02(4, 'Shrub');
+classChart02(5, 'Forbs');
+classChart02(6, 'Heath');
+
+
+//for Landsat 5
+var classChart86 = function(Class, label, color){
+  var options = {
+    title: '1986 Spectral Signatures for ' + label + ' Class',
+    hAxis: {title: 'Bands'},
+    vAxis: {title: 'Reflectance'},
+    lineWidth: 1,
+    pointSize: 4,
+  };
+  
+  var fc86 = StratifiedTraining86.filter(ee.Filter.eq('classification', Class));
+  ////Export your table to Drive so you can chart outside of GEE if desired
+  ////Comment out when you're not using this so that the charts don't shrink
+  //Export.table.toDrive({
+  //collection: fc86,
+  //description: '1986_Stratified_Spectral_Sigs_for_' + label,
+  //folder: 'SpectralSigs',
+  //fileFormat: 'CSV'
+  //});
+  var chart86 = ui.Chart.feature.byProperty({
+    features: fc86,
+    xProperties: bandDescriptionsL5,
+  }).setChartType('ScatterChart').setOptions(options);
+  
+print(chart86);
+};
+
+//classChart(0, 'Water');
+classChart86(1, 'Snow');
+classChart86(2, 'Rock');
+classChart86(3, 'Forest');
+classChart86(4, 'Shrub');
+classChart86(5, 'Forbs');
+classChart86(6, 'Heath');
+

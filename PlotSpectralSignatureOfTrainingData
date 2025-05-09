@@ -1,0 +1,376 @@
+//This code is to calculate spectral responses of training data 
+////to see if there are differences across satellites
+
+//You will need:
+    //training points you use on a particular sensor
+    //a classified image from your earlier classification
+    //a reference image of composited or raw Landsat surface reflectance
+  //For example: You will have a composited Landsat 8 image for 2021, a classified image from 2021,
+  ////and training data for Landsat 8 (repeated for each sensor)
+//This script uses data from all Landsat sensors at once to make comparable comparisons between sensors
+
+
+//Heads up: we are asking GEE to do something it is not optimized for which is tabular data.
+//This code will probably take a while to run and will perform slowly, you can help by
+////not printing information too often or unnecessarilly
+
+//First step: insert you training data, classified image, and reference image as imports to the script
+
+//define your classes, these are for the Nellie Juan but can be changed to match your training data
+var classNames = ee.List(['water','snow', 'rock', 'forest', 'shrub', 'forbs', 'heath']);
+
+
+var bandDescriptionsL8 = { //<- band descriptions for Landsat 8 OLI and Indices
+  'B2': 'B02/Blue 0.452-0.512',
+  'B3': 'B03/Green 0.533-0.590',
+  'B4': 'B04/Red 0.636-0.673',
+  'B5': 'B05/NIR 0.851-0.879',
+  'B6': 'B06/SWIR1 1.566-1.651',
+  'B7': 'B07/SWIR2 2.107-2.294',
+  'elevation': 'Elevation',
+  'slope': 'Slope',
+  'aspect': 'Aspect',
+  'NDVI': 'NDVI',
+  'NDSI': 'NDSI'
+};
+
+var bandDescriptionsL5 = {//<- band descriptions for Landsat 5 TM and 7 ETM+ and Indices
+  'B1': 'B01/Blue 0.45-0.52',
+  'B2': 'B02/Green 0.52-0.60',
+  'B3': 'B03/Red 0.63-0.69',
+  'B4': 'B04/NIR 0.77-0.9',
+  'B5': 'B05/SWIR1 1.55-1.75',
+  'B7': 'B07/SWIR2 2.08-2.35',
+  'elevation': 'Elevation',
+  'slope': 'Slope',
+  'aspect': 'Aspect',
+  'NDVI': 'NDVI',
+  'NDSI': 'NDSI'
+};
+
+//we first sample the composited imagery using the training data we have
+var training21 = img21.sampleRegions({ //<- this is the training data sampled over imagery
+  collection: points21.filter(ee.Filter.neq('Class', 0)),
+  properties: ['Class'],
+  scale: 30
+});
+
+//for Landsat 7
+var training02 = img02.sampleRegions({
+  collection: points02,
+  properties: ['Class'],
+  scale: 30
+});
+
+//For Landsat 5
+var training86 = img86.sampleRegions({
+  collection: points86,
+  properties: ['Class'],
+  scale: 30
+});
+
+
+
+//now we need to see how each point responds within each band. We need to sample data over each band and
+//for X number of bands, the process needs to happen X number of times.
+//We are indexing the data by landocver property (or Class) to group the reuslts
+var bands21 = img21.bandNames();
+//print('bands 2021', bands21);
+var numBands21 = bands21.length();
+//print('numBands 2021', numBands21);
+var bandsWithClass21 = bands21.add('classification');
+//print('bandsWithClass 2021', bandsWithClass21);
+var classIndex21 = bandsWithClass21.indexOf('classification');
+//print('classIndex 2021', classIndex21);
+
+//for Landsat 7
+var bands02 = img02.bandNames();
+//print('bands 2002', bands02);
+var numBands02 = bands02.length();
+//print('numBands 2002', numBands02);
+var bandsWithClass02 = bands02.add('classification');
+//print('bandsWithClass 2002', bandsWithClass02);
+var classIndex02 = bandsWithClass02.indexOf('classification');
+//print('classIndex 2002', classIndex02);
+
+//for Landsat 5
+var bands86 = img86.bandNames();
+//print('bands 1986', bands86);
+var numBands86 = bands86.length();
+//print('numBands 1986', numBands86);
+var bandsWithClass86 = bands86.add('classification');
+//print('bandsWithClass 1986', bandsWithClass86);
+var classIndex86 = bandsWithClass86.indexOf('classification');
+//print('classIndex 1986', classIndex86);
+
+//Now lets calculate the mean and standard deviations for the signatures. We are 
+//using combine command to get reducer to do multiple stats for a single input
+//This makes an empty reducer function to apply later
+var combinedReducer = ee.Reducer.mean().combine({
+  reducer2: ee.Reducer.stdDev(),
+  sharedInputs: true
+});
+
+
+//you need to repeat the reducer we created above so that it can sample bands over training data
+//this is just the same reducer but repeated for X number of bands
+//var repeatedReducer = combinedReducer.repeat(numBands).group(classIndex);
+
+//get the stats for each point in the training data
+var TDpointsStats21 = training21.filter(ee.Filter.neq('classification', 'water')).reduceColumns({
+  selectors: bands21.add('Class'),
+  reducer: combinedReducer.repeat(numBands21).group(classIndex21)
+});
+//print('pointsStats21', pointsStats21); //<- this is a huge csv so be careful printing it
+
+//For Landsat 7
+var TDpointsStats02 = training02.reduceColumns({
+  selectors: bands02.add('Class'),
+  reducer: combinedReducer.repeat(numBands02).group(classIndex02)
+});
+//print('pointsStats02', pointsStats02); //<- this is a huge csv so be careful printing it
+
+//For Landsat 5
+var TDpointsStats86 = training86.reduceColumns({
+  selectors: bands86.add('Class'),
+  reducer: combinedReducer.repeat(numBands02).group(classIndex02)
+});
+//print('pointsStats86', pointsStats86); //<- this is a huge csv so be careful printing it
+
+//get the point stats into groups for plotting
+var TDgroups21 = ee.List(TDpointsStats21.get('groups'));
+//print('groups21', TDgroups21); //<- only print these if you are getting errors you need to check
+
+var TDgroups02 = ee.List(TDpointsStats02.get('groups'));
+//print('groups02', TDgroups02);
+
+var TDgroups86 = ee.List(TDpointsStats86.get('groups'));
+//print('groups86', TDgroups86);
+
+
+//create the feature class to chart for training data
+var TDfc21 = ee.FeatureCollection(TDgroups21.map(function(item) {
+  //get the mean values
+  var values = ee.Dictionary(item).get('mean');
+  var groupNumber = ee.Dictionary(item).get('group');
+  var properties = ee.Dictionary.fromLists(bands21, values);
+  var withClass = properties.set('class', classNames.get(groupNumber));
+  return ee.Feature(null, withClass);
+}));
+
+var TDfc02 = ee.FeatureCollection(TDgroups02.map(function(item) {
+  //get the mean values
+  var values = ee.Dictionary(item).get('mean');
+  var groupNumber = ee.Dictionary(item).get('group');
+  var properties = ee.Dictionary.fromLists(bands02, values);
+  var withClass = properties.set('class', classNames.get(groupNumber));
+  return ee.Feature(null, withClass);
+}));
+
+var TDfc86 = ee.FeatureCollection(TDgroups86.map(function(item) {
+  //get the mean values
+  var values = ee.Dictionary(item).get('mean');
+  var groupNumber = ee.Dictionary(item).get('group');
+  var properties = ee.Dictionary.fromLists(bands86, values);
+  var withClass = properties.set('class', classNames.get(groupNumber));
+  return ee.Feature(null, withClass);
+}));
+
+//Export data if you want to use it elsewhere
+//Export.table.toDrive({
+//  collection: TDfc21,
+//  description: '2021_TrainingData_Spectral_Sigs_classes_by_band',
+//  folder: 'SpectralSigs',
+//  fileFormat: 'CSV'
+//});
+
+//Export.table.toDrive({
+//  collection: TDfc02,
+//  description: '2002_TrainingData_Spectral_Sigs_classes_by_band',
+//  folder: 'SpectralSigs',
+//  fileFormat: 'CSV'
+//});
+
+//Export.table.toDrive({
+//  collection: TDfc86,
+//  description: '1986_TrainingData_Spectral_Sigs_classes_by_band',
+//  folder: 'SpectralSigs',
+//  fileFormat: 'CSV'
+//});
+
+//set your options for charting data
+var TDoptions21 = {
+  title: '2021 Mean Spectral Signatures for Training Data',
+  hAxis: {title: 'Bands'},
+  vAxis: {title: 'Reflectance'},
+  lineWidth: 1,
+  pointSize: 4,
+  series: {
+    //0: {color: '1E41C6'},
+    0: {color: 'E0E0E0'},
+    1: {color: '45414E'},
+    2: {color: '0E5B07'},
+    3: {color: 'CE6C47'},
+    4: {color: 'FFC145'},
+    5: {color: 'f23333'}
+  }
+};
+var TDoptions02 = {
+  title: '2002 Mean Spectral Signatures for Training Data',
+  hAxis: {title: 'Bands'},
+  vAxis: {title: 'Reflectance'},
+  lineWidth: 1,
+  pointSize: 4,
+  series: {
+    //0: {color: '1E41C6'},
+    0: {color: 'E0E0E0'},
+    1: {color: '45414E'},
+    2: {color: '0E5B07'},
+    3: {color: 'CE6C47'},
+    4: {color: 'FFC145'},
+    5: {color: 'f23333'}
+  }
+};
+var TDoptions86 = {
+  title: '1986 Mean Spectral Signatures for Training Data',
+  hAxis: {title: 'Bands'},
+  vAxis: {title: 'Reflectance'},
+  lineWidth: 1,
+  pointSize: 4,
+  series: {
+    //0: {color: '1E41C6'},
+    0: {color: 'E0E0E0'},
+    1: {color: '45414E'},
+    2: {color: '0E5B07'},
+    3: {color: 'CE6C47'},
+    4: {color: 'FFC145'},
+    5: {color: 'f23333'}
+  }
+};
+
+//plot the chart for average band values across each class
+var TDchart21 = ui.Chart.feature.byProperty({
+  features: TDfc21,
+  xProperties: bandDescriptionsL8,
+  seriesProperty: 'class'
+}).setChartType('ScatterChart').setOptions(TDoptions21);
+
+print(TDchart21);
+
+var TDchart02 = ui.Chart.feature.byProperty({
+  features: TDfc02,
+  xProperties: bandDescriptionsL5,
+  seriesProperty: 'class'
+}).setChartType('ScatterChart').setOptions(TDoptions02);
+
+print(TDchart02);
+
+var TDchart86 = ui.Chart.feature.byProperty({
+  features: TDfc86,
+  xProperties: bandDescriptionsL5,
+  seriesProperty: 'class'
+}).setChartType('ScatterChart').setOptions(TDoptions86);
+
+print(TDchart86);
+
+//This is where we create the multiple charts for each class and can see each training pixel
+var TDclassChart21 = function(Class, label, color){
+  var options = {
+    title: '2021 Training Data Spectral Signatures for ' + label + ' Class',
+    hAxis: {title: 'Bands'},
+    vAxis: {title: 'Reflectance'},
+    lineWidth: 1,
+    pointSize: 4,
+  };
+  
+  var fc = training21.filter(ee.Filter.eq('Class', Class));
+  ////Another export function
+  //Export.table.toDrive({
+  //collection: fc,
+  //description: '2021_TrainingData_Spectral_Sigs_for_' + label,
+  //folder: 'SpectralSigs',
+  //fileFormat: 'CSV'
+  //});
+  var chart = ui.Chart.feature.byProperty({
+    features: fc,
+    xProperties: bandDescriptionsL8,
+  }).setChartType('ScatterChart').setOptions(options);
+  
+print(chart);
+};
+
+//TDclassChart21(0, 'Water');
+TDclassChart21(1, 'Snow');
+TDclassChart21(2, 'Rock');
+TDclassChart21(3, 'Forest');
+TDclassChart21(4, 'Shrub');
+TDclassChart21(5, 'Forbs');
+TDclassChart21(6, 'Heath');
+
+//This is where we create the multiple charts for each class and can see each training pixel
+var TDclassChart02 = function(Class, label, color){
+  var options = {
+    title: '2002 Training Data Spectral Signatures for ' + label + ' Class',
+    hAxis: {title: 'Bands'},
+    vAxis: {title: 'Reflectance'},
+    lineWidth: 1,
+    pointSize: 4,
+  };
+  
+  var fc = training02.filter(ee.Filter.eq('Class', Class));
+  ////Another export function
+  //Export.table.toDrive({
+  //collection: fc,
+  //description: '2002_TrainingData_Spectral_Sigs_for_' + label,
+  //folder: 'SpectralSigs',
+  //fileFormat: 'CSV'
+  //});
+  var chart = ui.Chart.feature.byProperty({
+    features: fc,
+    xProperties: bandDescriptionsL5,
+  }).setChartType('ScatterChart').setOptions(options);
+  
+print(chart);
+};
+
+//TDclassChart02(0, 'Water');
+TDclassChart02(1, 'Snow');
+TDclassChart02(2, 'Rock');
+TDclassChart02(3, 'Forest');
+TDclassChart02(4, 'Shrub');
+TDclassChart02(5, 'Forbs');
+TDclassChart02(6, 'Heath');
+
+//This is where we create the multiple charts for each class and can see each training pixel
+var TDclassChart86 = function(Class, label, color){
+  var options = {
+    title: '1986 Training Data Spectral Signatures for ' + label + ' Class',
+    hAxis: {title: 'Bands'},
+    vAxis: {title: 'Reflectance'},
+    lineWidth: 1,
+    pointSize: 4,
+  };
+  
+  var fc = training86.filter(ee.Filter.eq('Class', Class));
+  ////Another export function
+  //Export.table.toDrive({
+  //collection: fc,
+  //description: '1986_TrainingData_Spectral_Sigs_for_' + label,
+  //folder: 'SpectralSigs',
+  //fileFormat: 'CSV'
+  //});
+  var chart = ui.Chart.feature.byProperty({
+    features: fc,
+    xProperties: bandDescriptionsL5,
+  }).setChartType('ScatterChart').setOptions(options);
+  
+print(chart);
+};
+
+//TDclassChart86(0, 'Water');
+TDclassChart86(1, 'Snow');
+TDclassChart86(2, 'Rock');
+TDclassChart86(3, 'Forest');
+TDclassChart86(4, 'Shrub');
+TDclassChart86(5, 'Forbs');
+TDclassChart86(6, 'Heath');

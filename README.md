@@ -8,4 +8,7 @@ There are other optional codes in this repository as well.
 Spectral Signature charting allows you to check your training data and classifications for continuity across satellites
 Scan Line Correction accounts for scan line failure on Landsat 7 and should be added to codes using Landsat 7 data.
 
-Reference data exist for all of these codes and are available upon request
+Reference training data for the Nellie Juan Watershed exist at these links:
+Landsat 7 (2002): https://code.earthengine.google.com/?asset=projects/boise-state-bull-thesis-work/assets/NJ6Classes02_DEC16_2024
+Landsat 5 (1986): https://code.earthengine.google.com/?asset=projects/boise-state-bull-thesis-work/assets/NJ6Classes86_DEC16_2024
+Landsat 8 (2016): https://code.earthengine.google.com/?asset=projects/boise-state-bull-thesis-work/assets/NJ6Classes21_DEC16_2024
